@@ -2,7 +2,7 @@
  * CVE 동기화 서비스 — cvelistV5(GitHub) 기반 구조화 Ingestion.
  *
  * 소스 구조:
- *   ① 로컬 클론 디렉토리 … cves/<년도>/CVE-*.json 탐색 (git clone/pull은 사용자가 수행)
+ *   ① 로컬 클론 디렉토리 … cves/<년도>/<배치>/CVE-*.json 재귀 탐색 (git clone/pull은 사용자가 수행)
  *   ② Releases 델타/베이스라인 ZIP … 다운로드 후 압축 내 JSON 파싱
  *   ③ 단건 조회 … raw.githubusercontent.com 경유 CVE-ID.json fetch
  *
@@ -135,7 +135,7 @@ function ingestBatch(
   return { ingested, skipped };
 }
 
-// ── ① 로컬 클론 디렉토리 가져오기 (cves/년도/CVE-*.json) ──
+// ── ① 로컬 클론 디렉토리 가져오기 (cves/년도/배치/CVE-*.json, 재귀 탐색) ──
 export function importLocalDir(
   store: GraphStore,
   cvesDir: string,
@@ -144,24 +144,31 @@ export function importLocalDir(
   const batch: FeedVulnerabilityItem[] = [];
   let scanned = 0;
   const max = (opts.maxRecords ?? 5000) * 4; // 필터 전 스캔 상한
+  let overLimit = false;
 
-  const years = fs.existsSync(cvesDir)
-    ? fs.readdirSync(cvesDir, { withFileTypes: true }).filter((e) => e.isDirectory())
-    : [];
-  outer: for (const year of years) {
-    const files = fs.readdirSync(path.join(cvesDir, year.name));
-    for (const file of files) {
-      if (!/^CVE-.*\.json$/i.test(file)) continue;
-      scanned += 1;
-      if (scanned > max) break outer;
-      try {
-        const text = fs.readFileSync(path.join(cvesDir, year.name, file), 'utf-8');
-        batch.push(...parseCveV5Text(text));
-      } catch {
-        // 손상 파일 스킵
+  function walk(dir: string): void {
+    if (overLimit || !fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (overLimit) return;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile() && /^CVE-.*\.json$/i.test(entry.name)) {
+        scanned += 1;
+        if (scanned > max) {
+          overLimit = true;
+          return;
+        }
+        try {
+          batch.push(...parseCveV5Text(fs.readFileSync(full, 'utf-8')));
+        } catch {
+          // 손상 파일 스킵
+        }
       }
     }
   }
+
+  walk(cvesDir);
   const { ingested, skipped } = ingestBatch(store, batch, opts);
   return { scanned, ingested, skipped, source: `local:${cvesDir}` };
 }
@@ -195,14 +202,45 @@ export function importZip(
   return { scanned, ingested, skipped, source: `zip:${path.basename(zipPath)}` };
 }
 
-// ── ③ 단건 조회 (raw.githubusercontent) ──
+// ── ③ 단건 조회 ──
+// cvelistV5 실제 배치 구조(cves/년도/Nxxx/CVE-ID.json) 우선,
+// 실패 시 MITRE CVE API로 폴백
+export function cveBatchDir(cveId: string): string {
+  const seq = parseInt(cveId.split('-')[2] ?? '0', 10);
+  return `${Math.floor(seq / 1000)}xxx`;
+}
+
 export async function fetchCveById(store: GraphStore, cveId: string): Promise<SyncResult> {
   const id = cveId.trim().toUpperCase();
   if (!/^CVE-\d{4}-\d+$/.test(id)) throw new Error(`CVE ID 형식이 아닙니다: ${cveId}`);
   const year = id.split('-')[1];
-  const url = `${CVE_RAW_BASE}/${year}/${id}.json`;
-  const res = await axios.get(url, { timeout: 15000, responseType: 'text' });
-  const items = parseCveV5Text(typeof res.data === 'string' ? res.data : JSON.stringify(res.data));
+  const tried: string[] = [];
+  let recordText: string | null = null;
+
+  const rawUrl = `${CVE_RAW_BASE}/${year}/${cveBatchDir(id)}/${id}.json`;
+  tried.push(rawUrl);
+  try {
+    const res = await axios.get(rawUrl, { timeout: 15000, responseType: 'text' });
+    recordText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+  } catch {
+    // MITRE 폴백으로 계속
+  }
+
+  if (recordText === null) {
+    const mitreUrl = `https://cveawg.mitre.org/api/cve/${id}`;
+    tried.push(mitreUrl);
+    try {
+      const res = await axios.get(mitreUrl, { timeout: 15000, responseType: 'text' });
+      recordText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+    } catch (err: any) {
+      const status = err?.response?.status;
+      throw new Error(
+        `${id} 조회 실패 (HTTP ${status ?? '연결 오류'}). 시도 경로: ${tried.join(' / ')}`,
+      );
+    }
+  }
+
+  const items = parseCveV5Text(recordText);
   if (items.length === 0) throw new Error(`${id} 레코드를 해석할 수 없습니다.`);
   const { ingested, skipped } = ingestBatch(store, items, { includeNonNpm: true, maxRecords: 50 });
   return { scanned: items.length, ingested, skipped, source: `cve:${id}` };
