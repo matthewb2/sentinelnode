@@ -110,7 +110,7 @@ ipcMain.handle('select-directory', async () => {
 // AST 스캔 실행 (그래프 DB 파이프라인) — 성공 시 마지막 검색 폴더 저장
 ipcMain.handle('run-ast-scan', async (_, dirPath: string) => {
   try {
-    const reports = runAstScan(dirPath);
+    const reports = await runAstScan(dirPath);
     saveLastProjectPath(dirPath);
     return { success: true, reports };
   } catch (error: any) {

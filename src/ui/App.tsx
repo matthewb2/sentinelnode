@@ -417,7 +417,7 @@ export default function App() {
           <p className="text-xs text-slate-500">AST 기반 로컬 소스 코드 취약점 및 코딩 실수 진단 엔진</p>
         </div>
         <div className="flex items-center gap-3">
-          <div className="text-xs text-slate-500 font-mono">Engine: Babel AST Parser</div>
+          <div className="text-xs text-slate-500 font-mono">Engine: Babel AST + tree-sitter-c</div>
           <button
             onClick={() => void openSettings()}
             title="그래프 DB 저장 폴더 설정"

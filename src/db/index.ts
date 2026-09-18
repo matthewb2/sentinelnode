@@ -1,9 +1,11 @@
 /**
  * DB 파사드 — 그래프 DB 싱글턴과 스캔 파이프라인 진입점.
  *
- * 스캔 파이프라인(Gemini 설계 ③):
- *   파싱(AST→Code 노드) → CONTAINS 적재 → AST 대조(MATCHED)
- *   → package.json 의존성 적재(DEPENDS_ON) → CVE 대조(MATCHED) → 리포트
+ * 스캔 파이프라인(Gemini 설계 ③, C 확장):
+ *   파싱(JS: Babel AST / C: tree-sitter-c AST→Code 노드) → CONTAINS 적재
+ *   → AST 대조(MATCHED)
+ *   → 의존성 적재(package.json / C #include·vcpkg·conan → DEPENDS_ON)
+ *   → CVE 대조(MATCHED) → 리포트
  */
 import * as fs from 'fs';
 import * as os from 'os';
@@ -12,7 +14,8 @@ import * as parser from '@babel/parser';
 import traverse from '@babel/traverse';
 import { GraphStore, type DbStats } from './graphStore';
 import { ensureSeedLoaded } from './ingestion';
-import { matchAstNodes, matchDependencies } from './matcher';
+import { matchAstNodes, matchCIncludes, matchDependencies, type CIncludeRef } from './matcher';
+import { isCSource, parseCSource } from '../engine/cScanner';
 import { loadUserConfig, resolveDbFilePath } from '../userConfig';
 import type { MatchReport } from './types';
 
@@ -83,7 +86,71 @@ export interface ScanResult {
   stats: DbStats;
 }
 
-export function scanProject(dirPath: string, db: GraphStore = getDatabase()): ScanResult {
+/** C 의존성 버전 힌트 (vcpkg.json · conanfile.txt · CMakeLists.txt) */
+function readCDependencyVersions(dirPath: string): Record<string, string> {
+  const versions: Record<string, string> = {};
+  // vcpkg.json — dependencies / overrides
+  try {
+    const vcpkgPath = path.join(dirPath, 'vcpkg.json');
+    if (fs.existsSync(vcpkgPath)) {
+      const vcpkg = JSON.parse(fs.readFileSync(vcpkgPath, 'utf-8')) as {
+        dependencies?: Array<string | { name?: string; version?: string; 'version-string'?: string }>;
+        overrides?: Array<{ name?: string; version?: string; 'version-string'?: string }>;
+      };
+      for (const dep of vcpkg.dependencies ?? []) {
+        if (typeof dep === 'string') continue;
+        if (dep?.name && (dep.version ?? dep['version-string'])) {
+          versions[dep.name.toLowerCase()] = String(dep.version ?? dep['version-string']);
+        }
+      }
+      for (const dep of vcpkg.overrides ?? []) {
+        if (dep?.name && (dep.version ?? dep['version-string'])) {
+          versions[dep.name.toLowerCase()] = String(dep.version ?? dep['version-string']);
+        }
+      }
+    }
+  } catch {
+    // 손상된 vcpkg.json은 무시
+  }
+  // conanfile.txt — name/version[@...] 행
+  try {
+    const conanPath = path.join(dirPath, 'conanfile.txt');
+    if (fs.existsSync(conanPath)) {
+      for (const line of fs.readFileSync(conanPath, 'utf-8').split('\n')) {
+        const m = line.trim().match(/^([A-Za-z0-9_][\w+.-]*)\/([^\s@#]+)/);
+        if (m) versions[m[1].toLowerCase()] = m[2];
+      }
+    }
+  } catch {
+    // 무시
+  }
+  // CMakeLists.txt — find_package(<Pkg> <version>)
+  try {
+    const cmakePath = path.join(dirPath, 'CMakeLists.txt');
+    if (fs.existsSync(cmakePath)) {
+      const cmakeName: Record<string, string> = {
+        openssl: 'openssl',
+        curl: 'curl',
+        libxml2: 'libxml2',
+        zlib: 'zlib',
+        sqlite3: 'sqlite',
+        libpng: 'libpng',
+        expat: 'expat',
+      };
+      for (const line of fs.readFileSync(cmakePath, 'utf-8').split('\n')) {
+        const m = line.match(/find_package\s*\(\s*([A-Za-z0-9_]+)\s+(\d[\d.]*)/i);
+        if (m && cmakeName[m[1].toLowerCase()]) {
+          versions[cmakeName[m[1].toLowerCase()]] = m[2];
+        }
+      }
+    }
+  } catch {
+    // 무시
+  }
+  return versions;
+}
+
+export async function scanProject(dirPath: string, db: GraphStore = getDatabase()): Promise<ScanResult> {
   db.clearEphemeral();
   const project = db.ensureProject(dirPath);
   let codeCounter = 0;
@@ -108,6 +175,9 @@ export function scanProject(dirPath: string, db: GraphStore = getDatabase()): Sc
     db.link('CONTAINS', project.id, node.id);
     codeNodeIds.push(node.id);
   };
+
+  const cFiles: string[] = [];
+  const cIncludes: CIncludeRef[] = [];
 
   function walk(currentPath: string): void {
     const entries = fs.readdirSync(currentPath, { withFileTypes: true });
@@ -155,11 +225,38 @@ export function scanProject(dirPath: string, db: GraphStore = getDatabase()): Sc
             }
           },
         });
+      } else if (entry.isFile() && isCSource(entry.name)) {
+        cFiles.push(fullPath);
       }
     }
   }
 
   walk(dirPath);
+
+  // C/C++ 파일 — tree-sitter-c 파싱 → JS와 동일한 CodeNode 스키마로 적재
+  for (const cFile of cFiles) {
+    let code: string;
+    try {
+      code = fs.readFileSync(cFile, 'utf-8');
+    } catch {
+      continue;
+    }
+    let parsed;
+    try {
+      parsed = await parseCSource(code, cFile);
+    } catch {
+      continue;
+    }
+    for (const call of parsed.calls) {
+      emitCode(cFile, call.line, 'CallExpression', call.name, call.member);
+    }
+    for (const secret of parsed.secrets) {
+      emitCode(cFile, secret.line, 'VariableDeclarator', secret.name);
+    }
+    for (const inc of parsed.includes) {
+      cIncludes.push({ header: inc.header, file: cFile, line: inc.line });
+    }
+  }
 
   const codeNodes = codeNodeIds
     .map((id) => db.get(id))
@@ -179,6 +276,11 @@ export function scanProject(dirPath: string, db: GraphStore = getDatabase()): Sc
     } catch {
       // 손상된 package.json은 의존성 대조만 스킵
     }
+  }
+
+  // C/C++ 의존성(#include·vcpkg·conan) ↔ CVE 대조 — JS와 동일한 방식
+  if (cIncludes.length > 0) {
+    reports.push(...matchCIncludes(db, project.id, cIncludes, readCDependencyVersions(dirPath)));
   }
 
   db.save();

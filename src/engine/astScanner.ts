@@ -13,8 +13,9 @@ export interface AstVulnerabilityReport {
 
 /**
  * 대상 디렉토리를 그래프 DB 파이프라인으로 스캔.
- * 파싱(AST→Code 노드) → 취약점 패턴 대조 → 의존성 CVE 대조 → 리포트.
+ * 파싱(JS: Babel AST / C: tree-sitter-c AST→Code 노드) → 취약점 패턴 대조
+ * → 의존성 CVE 대조(package.json / C #include) → 리포트.
  */
-export function runAstScan(dirPath: string): AstVulnerabilityReport[] {
-  return scanProject(dirPath).reports;
+export async function runAstScan(dirPath: string): Promise<AstVulnerabilityReport[]> {
+  return (await scanProject(dirPath)).reports;
 }

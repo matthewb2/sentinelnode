@@ -101,3 +101,112 @@ export function matchDependencies(
   }
   return reports;
 }
+
+// ── C/C++ include → CVE 패키지 대조 (JS 의존성 대조와 동일한 방식) ──
+
+export interface CIncludeRef {
+  header: string;
+  file: string;
+  line: number;
+}
+
+const HEADER_TO_PACKAGE: Array<[RegExp, string]> = [
+  [/^openssl\//i, 'openssl'],
+  [/^curl\//i, 'curl'],
+  [/^(libxml\/|libxml2\/)/i, 'libxml2'],
+  [/^libssh\//i, 'libssh'],
+  [/^libgit2/i, 'libgit2'],
+  [/^gnutls\//i, 'gnutls'],
+  [/^nss\//i, 'nss'],
+  [/^libarchive\//i, 'libarchive'],
+  [/^libav(codec|format|util)\//i, 'ffmpeg'],
+  [/^png\.h$|^libpng.*\.h$/i, 'libpng'],
+  [/^jpeglib\.h$|^jerror\.h$/i, 'libjpeg-turbo'],
+  [/^sqlite3?\.h$/i, 'sqlite'],
+  [/^zlib\.h$/i, 'zlib'],
+  [/^expat\.h$|^libexpat\//i, 'expat'],
+  [/^pcre2?\.h$/i, 'pcre'],
+];
+
+/** `#include` 헤더 → CVE 제품명(affectedPackage 소문자) 매핑 */
+export function headerToPackage(header: string): string {
+  const h = header.trim();
+  for (const [re, pkg] of HEADER_TO_PACKAGE) {
+    if (re.test(h)) return pkg;
+  }
+  const first = h.split('/')[0].replace(/\.(h|hpp)$/i, '');
+  return (first || h).toLowerCase();
+}
+
+const SEVERITY_WEIGHT: Record<string, number> = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+  info: 4,
+};
+
+/**
+ * C/C++ `#include` ↔ CVE 대조.
+ * 설치 버전(vcpkg/conan 등)을 알면 semver로 정밀 대조하고,
+ * 버전을 모르면 의심 후보로 보고한다(심각도순 상한 적용).
+ */
+export function matchCIncludes(
+  store: GraphStore,
+  projectId: string,
+  includes: CIncludeRef[],
+  versions: Record<string, string> = {},
+  maxSuspected = 100,
+): MatchReport[] {
+  const reports: MatchReport[] = [];
+  const byPackage = new Map<string, CIncludeRef>();
+  for (const inc of includes) {
+    const pkg = headerToPackage(inc.header);
+    if (!byPackage.has(pkg)) byPackage.set(pkg, inc);
+  }
+
+  const suspected: Array<{ vuln: VulnerabilityNode; ref: CIncludeRef; pkg: string }> = [];
+
+  for (const [pkg, ref] of byPackage) {
+    const rawVersion = versions[pkg];
+    const version = rawVersion ? (semver.coerce(rawVersion)?.version ?? rawVersion) : undefined;
+    const pkgNode = store.ensurePackage(pkg, version ?? rawVersion);
+    store.link('DEPENDS_ON', projectId, pkgNode.id, { version: version ?? rawVersion ?? 'unknown' });
+
+    for (const vuln of store.findVulnerabilitiesByPackage(pkg)) {
+      if (version && vuln.versionRange) {
+        let hit = false;
+        try {
+          hit = semver.satisfies(version, vuln.versionRange, { includePrerelease: false });
+        } catch {
+          hit = false;
+        }
+        if (hit) {
+          store.link('MATCHED', pkgNode.id, vuln.id, { version });
+          reports.push(
+            toReport(ref.file, ref.line, vuln, { package: `${pkg}@${version}` }),
+          );
+        }
+      } else {
+        suspected.push({ vuln, ref, pkg });
+      }
+    }
+  }
+
+  suspected.sort((a, b) => {
+    const w = (SEVERITY_WEIGHT[a.vuln.severity] ?? 9) - (SEVERITY_WEIGHT[b.vuln.severity] ?? 9);
+    if (w !== 0) return w;
+    return (a.vuln.cveId ?? a.vuln.id).localeCompare(b.vuln.cveId ?? b.vuln.id);
+  });
+
+  for (const { vuln, ref, pkg } of suspected.slice(0, maxSuspected)) {
+    store.link('MATCHED', `pkg:${pkg}`, vuln.id, { version: 'unknown' });
+    reports.push(
+      toReport(ref.file, ref.line, vuln, {
+        package: `${pkg}@unknown`,
+        message: `${vuln.description} (설치 버전 미확인 — #include <${ref.header}> 기준 의심)`,
+      }),
+    );
+  }
+  return reports;
+}

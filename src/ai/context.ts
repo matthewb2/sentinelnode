@@ -17,6 +17,13 @@ const EXT_TO_LANG: Record<string, string> = {
   '.jsx': 'jsx',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
+  '.c': 'c',
+  '.h': 'c',
+  '.cpp': 'cpp',
+  '.hpp': 'cpp',
+  '.cc': 'cpp',
+  '.hh': 'cpp',
+  '.cxx': 'cpp',
 };
 
 export function languageOf(file: string): string {
