@@ -58,7 +58,26 @@ contextBridge.exposeInMainWorld('sentinelAPI', {
     >,
   getUserConfig: () =>
     ipcRenderer.invoke('get-user-config') as Promise<
-      | { success: true; config: { lastProjectPath: string | null; updatedAt: string | null } }
+      | {
+          success: true;
+          config: { lastProjectPath: string | null; updatedAt: string | null; dbDir: string | null; dbFilePath: string };
+        }
+      | { success: false; error: string }
+    >,
+  getDbStorage: () =>
+    ipcRenderer.invoke('get-db-storage') as Promise<
+      | { success: true; dbDir: string; dbFilePath: string; storagePath: string; stats: DbStats }
+      | { success: false; error: string }
+    >,
+  selectDbDirectory: () => ipcRenderer.invoke('select-db-directory') as Promise<string | null>,
+  setDbStorage: (dirPath: string) =>
+    ipcRenderer.invoke('set-db-storage', dirPath) as Promise<
+      | { success: true; dbDir: string; dbFilePath: string; storagePath: string; stats: DbStats }
+      | { success: false; error: string }
+    >,
+  resetDbStorage: () =>
+    ipcRenderer.invoke('reset-db-storage') as Promise<
+      | { success: true; dbDir: string; dbFilePath: string; storagePath: string; stats: DbStats }
       | { success: false; error: string }
     >,
   onCveSyncDone: (cb: (info: { updated: boolean; ingested: number; tag: string | null }) => void) => {

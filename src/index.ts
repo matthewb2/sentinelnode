@@ -4,9 +4,15 @@ import * as fs from 'fs';
 import * as path from 'path';
 import dotenv from 'dotenv';
 import { runAstScan } from './engine/astScanner';
-import { getDatabase, defaultStoragePath } from './db';
+import { currentStoragePath, getDatabase, defaultStoragePath, switchDatabase } from './db';
 import { ingestFeed, syncFromUrl } from './db/ingestion';
-import { loadUserConfig, saveLastProjectPath } from './userConfig';
+import {
+  loadUserConfig,
+  resetDbDir,
+  resolveDbFilePath,
+  saveDbDir,
+  saveLastProjectPath,
+} from './userConfig';
 import {
   buildWatchlist,
   checkForUpdates,
@@ -115,9 +121,88 @@ ipcMain.handle('run-ast-scan', async (_, dirPath: string) => {
 // 사용자 설정 조회 (마지막 검색 폴더 — 다음 로딩 시 기본값)
 ipcMain.handle('get-user-config', async () => {
   try {
-    return { success: true, config: loadUserConfig() };
+    const config = loadUserConfig();
+    return {
+      success: true,
+      config: { ...config, dbFilePath: resolveDbFilePath(config) },
+    };
   } catch (error: any) {
     return { success: false, error: error.message };
+  }
+});
+
+// 그래프 DB 저장 위치 조회 (폴더 + 파일 경로 + 상태)
+ipcMain.handle('get-db-storage', async () => {
+  try {
+    const config = loadUserConfig();
+    const dbFilePath = resolveDbFilePath(config);
+    const db = getDatabase();
+    return {
+      success: true,
+      dbDir: path.dirname(dbFilePath),
+      dbFilePath,
+      storagePath: dbFilePath,
+      stats: db.stats(),
+    };
+  } catch (error: any) {
+    return { success: false, error: error.message };
+  }
+});
+
+// 그래프 DB 폴더 선택 다이얼로그 (설정 메뉴에서 호출)
+ipcMain.handle('select-db-directory', async () => {
+  const result = await dialog.showOpenDialog({
+    title: '그래프 DB 저장 폴더 선택',
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  if (result.canceled) return null;
+  return result.filePaths[0];
+});
+
+// 그래프 DB 저장 폴더 변경 (설정 저장 → 새 경로로 DB 전환)
+ipcMain.handle('set-db-storage', async (_, dirPath: string) => {
+  try {
+    if (typeof dirPath !== 'string' || dirPath.trim().length === 0) {
+      return { success: false, error: 'DB 폴더 경로를 입력하세요.' };
+    }
+    const resolved = path.resolve(dirPath.trim());
+    let exists = fs.existsSync(resolved);
+    if (exists && !fs.statSync(resolved).isDirectory()) {
+      return { success: false, error: '해당 경로는 폴더가 아닙니다.' };
+    }
+    fs.mkdirSync(resolved, { recursive: true });
+    const config = saveDbDir(resolved);
+    const dbFilePath = resolveDbFilePath(config);
+    const db = switchDatabase(dbFilePath);
+    return {
+      success: true,
+      config,
+      dbDir: resolved,
+      dbFilePath,
+      storagePath: dbFilePath,
+      stats: db.stats(),
+    };
+  } catch (error: any) {
+    return { success: false, error: error.message || 'DB 폴더 변경에 실패했습니다.' };
+  }
+});
+
+// 그래프 DB 저장 폴더를 기본값으로 초기화
+ipcMain.handle('reset-db-storage', async () => {
+  try {
+    const config = resetDbDir();
+    const dbFilePath = resolveDbFilePath(config);
+    const db = switchDatabase(dbFilePath);
+    return {
+      success: true,
+      config,
+      dbDir: path.dirname(dbFilePath),
+      dbFilePath,
+      storagePath: dbFilePath,
+      stats: db.stats(),
+    };
+  } catch (error: any) {
+    return { success: false, error: error.message || 'DB 폴더 초기화에 실패했습니다.' };
   }
 });
 
@@ -125,7 +210,7 @@ ipcMain.handle('get-user-config', async () => {
 ipcMain.handle('get-db-stats', async () => {
   try {
     const db = getDatabase();
-    return { success: true, stats: db.stats(), storagePath: defaultStoragePath() };
+    return { success: true, stats: db.stats(), storagePath: currentStoragePath() };
   } catch (error: any) {
     return { success: false, error: error.message };
   }

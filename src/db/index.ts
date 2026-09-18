@@ -13,19 +13,46 @@ import traverse from '@babel/traverse';
 import { GraphStore, type DbStats } from './graphStore';
 import { ensureSeedLoaded } from './ingestion';
 import { matchAstNodes, matchDependencies } from './matcher';
+import { loadUserConfig, resolveDbFilePath } from '../userConfig';
 import type { MatchReport } from './types';
 
 let store: GraphStore | null = null;
+let activeStoragePath: string | null = null;
 
 export function defaultStoragePath(): string {
-  return path.join(os.homedir(), '.sentinelnode', 'graph-db.json');
+  try {
+    return resolveDbFilePath(loadUserConfig());
+  } catch {
+    return path.join(os.homedir(), '.sentinelnode', 'graph-db.json');
+  }
 }
 
-export function getDatabase(storagePath = defaultStoragePath()): GraphStore {
-  if (!store) {
-    store = new GraphStore(storagePath);
+/** 현재 사용 중인 DB 파일 경로 */
+export function currentStoragePath(): string {
+  return activeStoragePath ?? defaultStoragePath();
+}
+
+export function getDatabase(storagePath?: string): GraphStore {
+  const resolved = storagePath ?? defaultStoragePath();
+  if (!store || activeStoragePath !== resolved) {
+    store = new GraphStore(resolved);
+    activeStoragePath = resolved;
     ensureSeedLoaded(store);
+    try {
+      store.save();
+    } catch {
+      // 저장 실패는 무시 (읽기 전용 경로 등)
+    }
   }
+  return store;
+}
+
+/** DB 저장 위치 변경 — 싱글턴을 버리고 새 경로에서 다시 로드 */
+export function switchDatabase(storagePath: string): GraphStore {
+  store = new GraphStore(storagePath);
+  activeStoragePath = storagePath;
+  ensureSeedLoaded(store);
+  store.save();
   return store;
 }
 

@@ -38,7 +38,20 @@ declare global {
         { success: true } | { success: false; error: string }
       >;
       getUserConfig: () => Promise<
-        | { success: true; config: { lastProjectPath: string | null; updatedAt: string | null } }
+        | { success: true; config: { lastProjectPath: string | null; updatedAt: string | null; dbDir: string | null; dbFilePath: string } }
+        | { success: false; error: string }
+      >;
+      getDbStorage: () => Promise<
+        | { success: true; dbDir: string; dbFilePath: string; storagePath: string; stats: { vulnerabilities: number; relations: number } }
+        | { success: false; error: string }
+      >;
+      selectDbDirectory: () => Promise<string | null>;
+      setDbStorage: (dirPath: string) => Promise<
+        | { success: true; dbDir: string; dbFilePath: string; storagePath: string; stats: { vulnerabilities: number; relations: number } }
+        | { success: false; error: string }
+      >;
+      resetDbStorage: () => Promise<
+        | { success: true; dbDir: string; dbFilePath: string; storagePath: string; stats: { vulnerabilities: number; relations: number } }
         | { success: false; error: string }
       >;
       onCveSyncDone?: (cb: (info: { updated: boolean; ingested: number; tag: string | null }) => void) => () => void;
@@ -95,12 +108,20 @@ export default function App() {
   const [cveIdInput, setCveIdInput] = useState('');
   const [aiPanels, setAiPanels] = useState<Record<number, AiPanelState>>({});
   const [vscodeMsg, setVscodeMsg] = useState<string | null>(null);
+  // 설정 다이얼로그 (그래프 DB 저장 폴더)
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [dbDir, setDbDir] = useState('');
+  const [dbFilePath, setDbFilePath] = useState('');
+  const [settingsBusy, setSettingsBusy] = useState(false);
+  const [settingsMsg, setSettingsMsg] = useState<string | null>(null);
 
   const refreshDbInfo = async () => {
     try {
       const res = await window.sentinelAPI?.getDbStats?.();
       if (res && res.success) {
         setDbInfo(`GraphDB · 패턴 ${res.stats.vulnerabilities}개 · 릴레이션 ${res.stats.relations}개`);
+        setDbFilePath(res.storagePath);
+        setDbDir(res.storagePath.replace(/[\\/][^\\/]+$/, ''));
       }
     } catch {
       // 브라우저 미리보기 등 비-Electron 환경 무시
@@ -110,6 +131,74 @@ export default function App() {
       if (res && res.success) setSyncStatus(res.status);
     } catch {
       // 비-Electron 환경 무시
+    }
+  };
+
+  const openSettings = async () => {
+    setSettingsMsg(null);
+    setSettingsOpen(true);
+    try {
+      const res = await window.sentinelAPI?.getDbStorage?.();
+      if (res && res.success) {
+        setDbDir(res.dbDir);
+        setDbFilePath(res.dbFilePath);
+      }
+    } catch {
+      // 무시 (기본 표시 유지)
+    }
+  };
+
+  const handleBrowseDbDir = async () => {
+    setSettingsMsg(null);
+    try {
+      const picked = await window.sentinelAPI?.selectDbDirectory?.();
+      if (picked) setDbDir(picked);
+    } catch (err: any) {
+      setSettingsMsg(err.message || '폴더 선택에 실패했습니다.');
+    }
+  };
+
+  const handleApplyDbDir = async () => {
+    if (!dbDir.trim()) {
+      setSettingsMsg('DB 폴더 경로를 입력하거나 찾아보기로 선택하세요.');
+      return;
+    }
+    setSettingsBusy(true);
+    setSettingsMsg(null);
+    try {
+      const res = await window.sentinelAPI?.setDbStorage?.(dbDir.trim());
+      if (res && res.success) {
+        setDbDir(res.dbDir);
+        setDbFilePath(res.dbFilePath);
+        setSettingsMsg(`DB 폴더 변경됨: ${res.dbDir}`);
+        await refreshDbInfo();
+      } else {
+        setSettingsMsg((res as any)?.error || 'DB 폴더 변경 실패');
+      }
+    } catch (err: any) {
+      setSettingsMsg(err.message || 'DB 폴더 변경 실패');
+    } finally {
+      setSettingsBusy(false);
+    }
+  };
+
+  const handleResetDbDir = async () => {
+    setSettingsBusy(true);
+    setSettingsMsg(null);
+    try {
+      const res = await window.sentinelAPI?.resetDbStorage?.();
+      if (res && res.success) {
+        setDbDir(res.dbDir);
+        setDbFilePath(res.dbFilePath);
+        setSettingsMsg(`기본값으로 복원됨: ${res.dbDir}`);
+        await refreshDbInfo();
+      } else {
+        setSettingsMsg((res as any)?.error || '초기화 실패');
+      }
+    } catch (err: any) {
+      setSettingsMsg(err.message || '초기화 실패');
+    } finally {
+      setSettingsBusy(false);
     }
   };
 
@@ -327,7 +416,16 @@ export default function App() {
         <div>          
           <p className="text-xs text-slate-500">AST 기반 로컬 소스 코드 취약점 및 코딩 실수 진단 엔진</p>
         </div>
-        <div className="text-xs text-slate-500 font-mono">Engine: Babel AST Parser</div>
+        <div className="flex items-center gap-3">
+          <div className="text-xs text-slate-500 font-mono">Engine: Babel AST Parser</div>
+          <button
+            onClick={() => void openSettings()}
+            title="그래프 DB 저장 폴더 설정"
+            className="bg-white hover:bg-slate-100 border border-slate-300 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-medium transition shadow-sm"
+          >
+            설정
+          </button>
+        </div>
       </header>
       {dbInfo && (
         <div className="px-6 py-1.5 text-[11px] font-mono text-slate-500 bg-slate-50 border-b border-slate-200">
@@ -593,6 +691,100 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {/* 설정 다이얼로그: 그래프 DB 저장 폴더 */}
+      {settingsOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="설정 - 그래프 DB 저장 위치"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40"
+          onClick={() => {
+            if (!settingsBusy) setSettingsOpen(false);
+          }}
+        >
+          <div
+            className="w-[520px] max-w-[92vw] bg-white rounded-xl border border-slate-200 shadow-xl p-6 flex flex-col gap-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-slate-800">설정 · 그래프 DB 저장 위치</h2>
+              <button
+                onClick={() => {
+                  if (!settingsBusy) setSettingsOpen(false);
+                }}
+                aria-label="설정 닫기"
+                className="text-slate-400 hover:text-slate-600 text-lg leading-none px-2"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <label htmlFor="db-dir-input" className="text-xs font-medium text-slate-600">
+                DB 폴더 (graph-db.json이 저장되는 위치)
+              </label>
+              <div className="flex gap-2">
+                <input
+                  id="db-dir-input"
+                  value={dbDir}
+                  onChange={(e) => setDbDir(e.target.value)}
+                  spellCheck={false}
+                  placeholder="예: C:\data\sentinelnode"
+                  className="flex-1 bg-white border border-slate-300 rounded-lg px-3 py-2 text-xs font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                />
+                <button
+                  onClick={() => void handleBrowseDbDir()}
+                  disabled={settingsBusy}
+                  className="bg-white hover:bg-slate-100 disabled:opacity-40 border border-slate-300 text-slate-700 px-3 py-2 rounded-lg text-xs font-medium transition whitespace-nowrap"
+                >
+                  찾아보기…
+                </button>
+              </div>
+              {dbFilePath && (
+                <p className="text-[11px] font-mono text-slate-500 truncate" title={dbFilePath}>
+                  파일: {dbFilePath}
+                </p>
+              )}
+              <p className="text-[11px] text-slate-500">
+                폴더를 변경하면 즉시 새 위치의 DB로 전환됩니다. 기존 폴더의 파일은 이동되지 않습니다.
+              </p>
+            </div>
+
+            {settingsMsg && (
+              <div className="text-xs text-slate-600 bg-slate-50 border border-slate-200 px-3 py-2 rounded">
+                {settingsMsg}
+              </div>
+            )}
+
+            <div className="flex flex-wrap justify-end gap-2">
+              <button
+                onClick={() => void handleResetDbDir()}
+                disabled={settingsBusy}
+                className="bg-white hover:bg-slate-100 disabled:opacity-40 border border-slate-300 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-medium transition"
+              >
+                기본값 복원
+              </button>
+              <button
+                onClick={() => {
+                  if (!settingsBusy) setSettingsOpen(false);
+                }}
+                disabled={settingsBusy}
+                className="bg-white hover:bg-slate-100 disabled:opacity-40 border border-slate-300 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-medium transition"
+              >
+                닫기
+              </button>
+              <button
+                onClick={() => void handleApplyDbDir()}
+                disabled={settingsBusy}
+                className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white px-4 py-1.5 rounded-lg text-xs font-semibold transition"
+              >
+                {settingsBusy ? '적용 중…' : '적용'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
