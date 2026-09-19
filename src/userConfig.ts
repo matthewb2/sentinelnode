@@ -81,6 +81,18 @@ export function loadUserConfig(file = configPath()): UserConfig {
   }
 }
 
+/** 설정 파일 보장 — 없으면 기본값으로 생성, 있으면 검증된 값으로 정규화 */
+export function ensureUserConfig(file = configPath()): UserConfig {
+  const config = loadUserConfig(file);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(config, null, 2), 'utf-8');
+  } catch {
+    // 읽기 전용 경로 등 생성 실패는 무시 (메모리상 기본값 사용)
+  }
+  return config;
+}
+
 /** 마지막 검색 폴더 저장 (기존 DB 폴더 설정 유지) */
 export function saveLastProjectPath(dirPath: string, file = configPath()): UserConfig {
   const prev = loadUserConfig(file);

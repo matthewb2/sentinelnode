@@ -30,9 +30,21 @@ export class GraphStore {
   private nodes = new Map<string, GraphNode>();
   private relations = new Map<string, GraphRelation>();
   private relationCounter = 0;
+  /** (type/from/to) → relation 중복 검사 인덱스. link() O(N) 전수 스캔 방지 */
+  private linkIndex = new Map<string, GraphRelation>();
 
   constructor(private storagePath?: string) {
     if (storagePath) this.load();
+  }
+
+  private static linkKey(type: RelationType, from: string, to: string): string {
+    return type + "\u0000" + from + "\u0000" + to;
+  }
+
+  private rebuildLinkIndex(): void {
+    this.linkIndex = new Map(
+      [...this.relations.values()].map((r) => [GraphStore.linkKey(r.type, r.from, r.to), r]),
+    );
   }
 
   // ── 영속화 ───────────────────────────────────────────────
@@ -45,6 +57,7 @@ export class GraphStore {
       this.nodes = new Map(snap.nodes.map((n) => [n.id, n]));
       this.relations = new Map((snap.relations ?? []).map((r) => [r.id, r]));
       this.relationCounter = this.relations.size;
+      this.rebuildLinkIndex();
     } catch {
       // 손상된 스냅샷은 무시하고 빈 DB로 시작
     }
@@ -99,17 +112,19 @@ export class GraphStore {
     for (const [id, rel] of this.relations) {
       if (rel.type !== 'AFFECTS') this.relations.delete(id);
     }
+    this.rebuildLinkIndex();
   }
 
   // ── 릴레이션 ─────────────────────────────────────────────
   link(type: RelationType, from: string, to: string, props?: GraphRelation['props']): GraphRelation {
-    // 중복 릴레이션 방지
-    for (const rel of this.relations.values()) {
-      if (rel.type === type && rel.from === from && rel.to === to) return rel;
-    }
+    // 중복 릴레이션 방지 (인덱스 O(1) 조회)
+    const key = GraphStore.linkKey(type, from, to);
+    const existing = this.linkIndex.get(key);
+    if (existing) return existing;
     this.relationCounter += 1;
     const rel: GraphRelation = { id: `r${this.relationCounter}`, type, from, to, props };
     this.relations.set(rel.id, rel);
+    this.linkIndex.set(key, rel);
     return rel;
   }
 

@@ -10,12 +10,10 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import * as parser from '@babel/parser';
-import traverse from '@babel/traverse';
 import { GraphStore, type DbStats } from './graphStore';
 import { ensureSeedLoaded } from './ingestion';
 import { matchAstNodes, matchCIncludes, matchDependencies, type CIncludeRef } from './matcher';
-import { isCSource, parseCSource } from '../engine/cScanner';
+import { extractSourceFile, isSupportedSource, type ExtractedFile } from '../engine/fileExtractor';
 import { loadUserConfig, resolveDbFilePath } from '../userConfig';
 import type { MatchReport } from './types';
 
@@ -59,26 +57,20 @@ export function switchDatabase(storagePath: string): GraphStore {
   return store;
 }
 
+/** DB 싱글턴을 버리고 디스크 스냅샷에서 다시 로드 (워커 스캔 후 동기화용) */
+export function reloadDatabase(storagePath?: string): GraphStore {
+  const resolved = storagePath ?? currentStoragePath();
+  store = new GraphStore(resolved);
+  activeStoragePath = resolved;
+  ensureSeedLoaded(store);
+  return store;
+}
+
 /** 테스트용: 지정 경로의 독립 DB 인스턴스 반환 */
 export function createDatabase(storagePath?: string): GraphStore {
   const db = new GraphStore(storagePath);
   ensureSeedLoaded(db);
   return db;
-}
-
-const SECRET_NAMES = new Set(['password', 'secret', 'privatekey', 'api_key', 'apikey', 'token']);
-
-function calleeInfo(callee: any): { name?: string; member?: string } {
-  if (!callee) return {};
-  if (callee.type === 'Identifier') return { name: callee.name };
-  if (callee.type === 'MemberExpression' && callee.property) {
-    const member =
-      callee.property.type === 'Identifier' ? callee.property.name : String(callee.property.value ?? '');
-    const obj =
-      callee.object?.type === 'Identifier' ? callee.object.name : undefined;
-    return { name: obj ? `${obj}.${member}` : member, member };
-  }
-  return {};
 }
 
 export interface ScanResult {
@@ -150,7 +142,45 @@ function readCDependencyVersions(dirPath: string): Record<string, string> {
   return versions;
 }
 
-export async function scanProject(dirPath: string, db: GraphStore = getDatabase()): Promise<ScanResult> {
+export interface ScanProgress {
+  phase: 'walk' | 'parse' | 'match' | 'done';
+  scannedFiles: number;
+  totalFiles?: number;
+}
+
+export interface ScanOptions {
+  onProgress?: (info: ScanProgress) => void;
+}
+
+/** 스캔 대상 소스 파일 목록 수집 (파싱 없는 빠른 탐색) */
+export function collectSourceFiles(dirPath: string): string[] {
+  const files: string[] = [];
+  function walk(currentPath: string): void {
+    const entries = fs.readdirSync(currentPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(currentPath, entry.name);
+      if (entry.isDirectory()) {
+        if (['node_modules', '.git', 'dist', 'build'].includes(entry.name)) continue;
+        walk(fullPath);
+      } else if (entry.isFile() && isSupportedSource(entry.name)) {
+        files.push(fullPath);
+      }
+    }
+  }
+  walk(dirPath);
+  return files;
+}
+
+/**
+ * 집계 단계 — 추출 결과 → Code 노드 적재(CONTAINS) → AST 대조(MATCHED)
+ * → 의존성 적재·CVE 대조 → 리포트. 파싱을 포함하지 않아 가볍다.
+ */
+export function buildScanResult(
+  dirPath: string,
+  db: GraphStore,
+  extracted: ExtractedFile[],
+  opts?: ScanOptions,
+): ScanResult {
   db.clearEphemeral();
   const project = db.ensureProject(dirPath);
   let codeCounter = 0;
@@ -176,85 +206,16 @@ export async function scanProject(dirPath: string, db: GraphStore = getDatabase(
     codeNodeIds.push(node.id);
   };
 
-  const cFiles: string[] = [];
   const cIncludes: CIncludeRef[] = [];
-
-  function walk(currentPath: string): void {
-    const entries = fs.readdirSync(currentPath, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(currentPath, entry.name);
-      if (entry.isDirectory()) {
-        if (['node_modules', '.git', 'dist', 'build'].includes(entry.name)) continue;
-        walk(fullPath);
-      } else if (entry.isFile() && /\.(ts|tsx|js|jsx)$/.test(entry.name)) {
-        const code = fs.readFileSync(fullPath, 'utf-8');
-        let ast: any;
-        try {
-          ast = parser.parse(code, { sourceType: 'module', plugins: ['typescript', 'jsx'] });
-        } catch {
-          continue; // 문법 오류 파일 스킵
-        }
-        traverse(ast, {
-          CallExpression(p: any) {
-            const info = calleeInfo(p.node.callee);
-            emitCode(fullPath, p.node.loc?.start.line ?? 0, 'CallExpression', info.name, info.member);
-          },
-          NewExpression(p: any) {
-            const info = calleeInfo(p.node.callee);
-            emitCode(fullPath, p.node.loc?.start.line ?? 0, 'CallExpression', info.name, info.member);
-          },
-          MemberExpression(p: any) {
-            const prop = p.node.property;
-            const member = prop?.type === 'Identifier' ? prop.name : String(prop?.value ?? '');
-            if (member) {
-              emitCode(fullPath, p.node.loc?.start.line ?? 0, 'MemberExpression', undefined, member);
-            }
-          },
-          VariableDeclarator(p: any) {
-            if (
-              p.node.id.type === 'Identifier' &&
-              SECRET_NAMES.has(p.node.id.name.toLowerCase()) &&
-              p.node.init?.type === 'StringLiteral'
-            ) {
-              emitCode(
-                fullPath,
-                p.node.loc?.start.line ?? 0,
-                'VariableDeclarator',
-                p.node.id.name.toLowerCase(),
-              );
-            }
-          },
-        });
-      } else if (entry.isFile() && isCSource(entry.name)) {
-        cFiles.push(fullPath);
-      }
+  for (const item of extracted) {
+    for (const call of item.calls) {
+      emitCode(item.file, call.line, 'CallExpression', call.name, call.member);
     }
-  }
-
-  walk(dirPath);
-
-  // C/C++ 파일 — tree-sitter-c 파싱 → JS와 동일한 CodeNode 스키마로 적재
-  for (const cFile of cFiles) {
-    let code: string;
-    try {
-      code = fs.readFileSync(cFile, 'utf-8');
-    } catch {
-      continue;
+    for (const secret of item.secrets) {
+      emitCode(item.file, secret.line, 'VariableDeclarator', secret.name);
     }
-    let parsed;
-    try {
-      parsed = await parseCSource(code, cFile);
-    } catch {
-      continue;
-    }
-    for (const call of parsed.calls) {
-      emitCode(cFile, call.line, 'CallExpression', call.name, call.member);
-    }
-    for (const secret of parsed.secrets) {
-      emitCode(cFile, secret.line, 'VariableDeclarator', secret.name);
-    }
-    for (const inc of parsed.includes) {
-      cIncludes.push({ header: inc.header, file: cFile, line: inc.line });
+    for (const inc of item.includes) {
+      cIncludes.push({ header: inc.header, file: item.file, line: inc.line });
     }
   }
 
@@ -265,6 +226,11 @@ export async function scanProject(dirPath: string, db: GraphStore = getDatabase(
     );
 
   const reports: MatchReport[] = [...matchAstNodes(db, codeNodes)];
+  try {
+    opts?.onProgress?.({ phase: 'match', scannedFiles: extracted.length, totalFiles: extracted.length });
+  } catch {
+    // 진행률 콜백 오류는 스캔에 영향 없음
+  }
 
   // package.json 의존성 대조
   const pkgJsonPath = path.join(dirPath, 'package.json');
@@ -284,5 +250,38 @@ export async function scanProject(dirPath: string, db: GraphStore = getDatabase(
   }
 
   db.save();
+  try {
+    opts?.onProgress?.({ phase: 'done', scannedFiles: extracted.length, totalFiles: extracted.length });
+  } catch {
+    // 무시
+  }
   return { reports, stats: db.stats() };
+}
+
+/** 인프로세스 스캔 (워커 풀 사용 불가 시 폴백 — 메인 스레드 차단 가능) */
+export async function scanProject(
+  dirPath: string,
+  db: GraphStore = getDatabase(),
+  opts?: ScanOptions,
+): Promise<ScanResult> {
+  const files = collectSourceFiles(dirPath);
+  const extracted: ExtractedFile[] = [];
+  let done = 0;
+  for (const file of files) {
+    try {
+      const item = await extractSourceFile(file);
+      if (item) extracted.push(item);
+    } catch {
+      // 파일 단위 실패 스킵
+    }
+    done += 1;
+    if (done % 25 === 0 || done === files.length) {
+      try {
+        opts?.onProgress?.({ phase: 'parse', scannedFiles: done, totalFiles: files.length });
+      } catch {
+        // 무시
+      }
+    }
+  }
+  return buildScanResult(dirPath, db, extracted, opts);
 }

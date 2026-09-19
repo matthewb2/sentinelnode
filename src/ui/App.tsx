@@ -5,7 +5,8 @@ declare global {
   interface Window {
     sentinelAPI: {
       selectDirectory: () => Promise<string | null>;
-      runAstScan: (dirPath: string) => Promise<{ success: boolean; reports?: any[]; error?: string }>;
+      runAstScan: (dirPath: string) => Promise<{ success: boolean; reports?: any[]; error?: string; cancelled?: boolean }>;
+      cancelAstScan: () => Promise<{ success: boolean; cancelled?: boolean; error?: string }>;
       getDbStats: () => Promise<
         | { success: true; stats: { vulnerabilities: number; relations: number }; storagePath: string }
         | { success: false; error: string }
@@ -55,6 +56,7 @@ declare global {
         | { success: false; error: string }
       >;
       onCveSyncDone?: (cb: (info: { updated: boolean; ingested: number; tag: string | null }) => void) => () => void;
+      onScanProgress?: (cb: (info: { phase: string; scannedFiles: number; totalFiles?: number }) => void) => () => void;
     };
   }
 }
@@ -96,6 +98,9 @@ const SEVERITY_STYLE: Record<string, string> = {
   info: 'bg-slate-100 text-slate-600 border-slate-200',
 };
 
+/** 리포트 목록 페이지 크기 — 수천 건 렌더 폭증 방지 */
+const REPORT_PAGE_SIZE = 100;
+
 export default function App() {
   const [targetPath, setTargetPath] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -114,6 +119,9 @@ export default function App() {
   const [dbFilePath, setDbFilePath] = useState('');
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsMsg, setSettingsMsg] = useState<string | null>(null);
+  const [scanProgress, setScanProgress] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [reportPage, setReportPage] = useState(0);
 
   const refreshDbInfo = async () => {
     try {
@@ -220,8 +228,14 @@ export default function App() {
         void refreshDbInfo();
       }
     });
+    const offProgress = window.sentinelAPI?.onScanProgress?.((info) => {
+      const phaseLabel =
+        info.phase === 'parse' ? '병렬 파싱' : info.phase === 'match' ? '패턴 대조' : info.phase === 'done' ? '완료' : '파일 탐색';
+      setScanProgress(`${phaseLabel} · ${info.scannedFiles}개 파일`);
+    });
     return () => {
       off?.();
+      offProgress?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -325,6 +339,7 @@ export default function App() {
       setTargetPath(path);
       setReports([]);
       setAiPanels({});
+      setReportPage(0);
       setErrorMsg(null);
     }
   };
@@ -394,11 +409,15 @@ export default function App() {
     setErrorMsg(null);
     setAiPanels({});
     setVscodeMsg(null);
+    setScanProgress('백그라운드 분석 시작…');
 
     try {
       const result = await window.sentinelAPI.runAstScan(targetPath);
       if (result.success && result.reports) {
         setReports(result.reports);
+        setReportPage(0);
+      } else if (result.cancelled) {
+        setVscodeMsg('분석이 중단되었습니다.');
       } else {
         setErrorMsg(result.error || '스캔 중 오류가 발생했습니다.');
       }
@@ -406,6 +425,24 @@ export default function App() {
       setErrorMsg(err.message || '알 수 없는 오류 발생');
     } finally {
       setLoading(false);
+      setScanProgress(null);
+      setCancelling(false);
+    }
+  };
+
+  // 진행 중 분석 중단
+  const handleCancelScan = async () => {
+    setCancelling(true);
+    try {
+      const res = await window.sentinelAPI.cancelAstScan();
+      if (!res.success && !/진행 중인 분석이 없습니다/.test(res.error ?? '')) {
+        setErrorMsg(res.error || '분석 중단에 실패했습니다.');
+        setCancelling(false);
+      }
+      // 중단 성공 시 runAstScan 결과가 cancelled로 반환되어 finally에서 정리됨
+    } catch (err: any) {
+      setErrorMsg(err.message || '분석 중단에 실패했습니다.');
+      setCancelling(false);
     }
   };
 
@@ -454,6 +491,17 @@ export default function App() {
           >
             {loading ? 'AST 분석 중...' : '취약점 검사 시작'}
           </button>
+
+          {loading && (
+            <button
+              onClick={() => void handleCancelScan()}
+              disabled={cancelling}
+              title="진행 중인 분석을 중단합니다"
+              className="bg-white hover:bg-rose-50 disabled:opacity-40 border border-rose-300 text-rose-600 px-4 py-2 rounded-lg text-sm font-medium transition shadow-sm"
+            >
+              {cancelling ? '중지 중…' : '중지'}
+            </button>
+          )}
 
           <button
             onClick={() => void handleOpenVscode()}
@@ -563,6 +611,31 @@ export default function App() {
           <h2 className="text-sm font-semibold text-slate-700 uppercase tracking-wider">
             진단 리포트 <span className="text-indigo-600 font-mono ml-1">({reports.length} 건 탐지됨)</span>
           </h2>
+          {reports.length > REPORT_PAGE_SIZE && (
+            <div className="flex items-center gap-2 text-xs text-slate-600">
+              <button
+                onClick={() => setReportPage((p) => Math.max(0, p - 1))}
+                disabled={reportPage === 0}
+                className="bg-white hover:bg-slate-100 disabled:opacity-40 border border-slate-300 px-2.5 py-1 rounded-md transition"
+              >
+                이전
+              </button>
+              <span className="font-mono">
+                {reportPage * REPORT_PAGE_SIZE + 1}–{Math.min(reports.length, (reportPage + 1) * REPORT_PAGE_SIZE)} / {reports.length}
+              </span>
+              <button
+                onClick={() =>
+                  setReportPage((p) =>
+                    Math.min(Math.ceil(reports.length / REPORT_PAGE_SIZE) - 1, p + 1),
+                  )
+                }
+                disabled={(reportPage + 1) * REPORT_PAGE_SIZE >= reports.length}
+                className="bg-white hover:bg-slate-100 disabled:opacity-40 border border-slate-300 px-2.5 py-1 rounded-md transition"
+              >
+                다음
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="flex-1 bg-white border border-slate-200 rounded-xl overflow-hidden flex flex-col shadow-sm">
@@ -585,6 +658,9 @@ export default function App() {
                 <span className="h-8 w-8 rounded-full border-2 border-slate-200 border-t-indigo-600 animate-spin" />
                 <p className="font-medium">AST 분석 중…</p>
                 <span className="text-xs text-slate-400">소스코드 파싱 및 취약점 패턴 대조 중입니다.</span>
+                {scanProgress && (
+                  <span className="text-xs font-mono text-slate-500">{scanProgress}</span>
+                )}
               </div>
             ) : reports.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-full text-slate-400 text-sm gap-1">
@@ -592,7 +668,10 @@ export default function App() {
                 <span className="text-xs text-slate-400">프로젝트를 선택하고 검사를 시작하세요.</span>
               </div>
             ) : (
-              reports.map((report, idx) => {
+              reports
+                .slice(reportPage * REPORT_PAGE_SIZE, (reportPage + 1) * REPORT_PAGE_SIZE)
+                .map((report, sliceIdx) => {
+                const idx = reportPage * REPORT_PAGE_SIZE + sliceIdx;
                 const panel = aiPanels[idx];
                 return (
                 <React.Fragment key={idx}>

@@ -1,14 +1,18 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron';
 import { exec } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import dotenv from 'dotenv';
 import { runAstScan } from './engine/astScanner';
-import { currentStoragePath, getDatabase, defaultStoragePath, switchDatabase } from './db';
+import { buildScanResult, collectSourceFiles, currentStoragePath, getDatabase, defaultStoragePath, switchDatabase } from './db';
+import { WorkerPool } from './worker/workerPool';
 import { ingestFeed, syncFromUrl } from './db/ingestion';
 import {
+  ensureUserConfig,
   loadUserConfig,
   resetDbDir,
+  resolveDbDir,
   resolveDbFilePath,
   saveDbDir,
   saveLastProjectPath,
@@ -98,23 +102,114 @@ function createWindow(): void {
   });
 }
 
-// 폴더 선택창 호출
+// 폴더 선택창 호출 — 마지막 사용 폴더를 기본 선택으로 제시, 선택 즉시 저장
 ipcMain.handle('select-directory', async () => {
+  const lastPath = loadUserConfig().lastProjectPath;
   const result = await dialog.showOpenDialog({
     properties: ['openDirectory'],
+    ...(lastPath ? { defaultPath: lastPath } : {}),
   });
-  if (result.canceled) return null;
-  return result.filePaths[0];
+  if (result.canceled || result.filePaths.length === 0) return null;
+  const picked = result.filePaths[0];
+  try {
+    saveLastProjectPath(picked);
+  } catch {
+    // 설정 저장 실패해도 선택 결과는 반환
+  }
+  return picked;
 });
 
-// AST 스캔 실행 (그래프 DB 파이프라인) — 성공 시 마지막 검색 폴더 저장
-ipcMain.handle('run-ast-scan', async (_, dirPath: string) => {
+// 청크 워커 경로 (tsc 출력 dist/worker/chunkWorker.js) — 없으면 인프로세스 폴백
+function resolveChunkWorkerPath(): string | null {
+  const cand = path.join(__dirname, 'worker', 'chunkWorker.js');
   try {
-    const reports = await runAstScan(dirPath);
+    if (fs.existsSync(cand)) return cand;
+  } catch {
+    // 무시하고 폴백
+  }
+  return null;
+}
+
+/** 워커 풀 크기 — 1코어는 UI/메인에 양보, 2~4개로 제한 */
+function resolvePoolSize(): number {
+  let cores = 4;
+  try {
+    cores =
+      typeof os.availableParallelism === 'function' ? os.availableParallelism() : (os.cpus()?.length ?? 4);
+  } catch {
+    cores = 4;
+  }
+  return Math.min(4, Math.max(2, cores - 1));
+}
+
+const SCAN_CHUNK_SIZE = 25;
+
+// AST 스캔 실행 — 동적 작업 분산(WorkerPool): 파일 청크 큐를 병렬 워커가
+// 가져가 파싱하고, 메인에서는 가벼운 집계·DB 대조만 수행한다.
+let activeScan: { pool: WorkerPool; cancelled: boolean } | null = null;
+
+ipcMain.handle('run-ast-scan', async (_, dirPath: string) => {
+  if (activeScan) {
+    return { success: false, error: '이미 분석이 진행 중입니다.' };
+  }
+  const chunkWorkerPath = resolveChunkWorkerPath();
+  if (!chunkWorkerPath) {
+    // 패키징 누락 등 예외 상황 폴백 (동기 블로킹 가능, 취소 불가)
+    try {
+      const reports = await runAstScan(dirPath);
+      saveLastProjectPath(dirPath);
+      return { success: true, reports };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  }
+  const pool = new WorkerPool(chunkWorkerPath, resolvePoolSize());
+  const scan = { pool, cancelled: false };
+  activeScan = scan;
+  const sendProgress = (info: { phase: string; scannedFiles: number; totalFiles?: number }): void => {
+    try {
+      mainWindow?.webContents.send('ast-scan-progress', info);
+    } catch {
+      // 윈도우 종료 등 무시
+    }
+  };
+  try {
+    // 1. 파일 목록 수집 (파싱 없는 빠른 탐색)
+    const files = collectSourceFiles(dirPath);
+    sendProgress({ phase: 'walk', scannedFiles: files.length, totalFiles: files.length });
+    // 2. 청크 큐 → 워커 풀 병렬 파싱 (일이 끝난 워커가 다음 청크를 가져감)
+    const { cancelled, results } = await pool.run(files, SCAN_CHUNK_SIZE, ({ completedFiles, totalFiles }) => {
+      sendProgress({ phase: 'parse', scannedFiles: completedFiles, totalFiles });
+    });
+    if (cancelled || scan.cancelled) {
+      return { success: false, cancelled: true };
+    }
+    // 3. 집계·DB 대조 (메인, 파싱 없음)
+    const { reports } = buildScanResult(dirPath, getDatabase(), results, {
+      onProgress: (p) => sendProgress({ phase: p.phase, scannedFiles: p.scannedFiles, totalFiles: p.totalFiles }),
+    });
     saveLastProjectPath(dirPath);
     return { success: true, reports };
   } catch (error: any) {
     return { success: false, error: error.message };
+  } finally {
+    if (activeScan === scan) activeScan = null;
+    await pool.dispose().catch(() => undefined);
+  }
+});
+
+// 진행 중 분석 중단 — 풀 워커 전원 종료 (집계 전이므로 DB 불일치 없음)
+ipcMain.handle('cancel-ast-scan', async () => {
+  const scan = activeScan;
+  if (!scan) {
+    return { success: false, error: '진행 중인 분석이 없습니다.' };
+  }
+  try {
+    scan.cancelled = true;
+    await scan.pool.cancel();
+    return { success: true, cancelled: true };
+  } catch (error: any) {
+    return { success: false, error: error.message || '분석 중단에 실패했습니다.' };
   }
 });
 
@@ -149,11 +244,12 @@ ipcMain.handle('get-db-storage', async () => {
   }
 });
 
-// 그래프 DB 폴더 선택 다이얼로그 (설정 메뉴에서 호출)
+// 그래프 DB 폴더 선택 다이얼로그 (설정 메뉴에서 호출) — 현재 DB 폴더를 기본 선택으로 제시
 ipcMain.handle('select-db-directory', async () => {
   const result = await dialog.showOpenDialog({
     title: '그래프 DB 저장 폴더 선택',
     properties: ['openDirectory', 'createDirectory'],
+    defaultPath: resolveDbDir(loadUserConfig()),
   });
   if (result.canceled) return null;
   return result.filePaths[0];
@@ -392,6 +488,8 @@ ipcMain.handle('open-in-vscode', async (_, payload: { file?: string; line?: numb
 });
 
 app.whenReady().then(() => {
+  // 사용자 설정 파일 보장 (~/.sentinelnode/config.json)
+  ensureUserConfig();
   createWindow();
 
   // 시작 시 백그라운드 검사 → 업데이트 있으면 엔진에 자동 반영 (창 표시 차단 안 함)

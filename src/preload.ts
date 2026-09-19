@@ -13,6 +13,10 @@ type IpcFail = { success: false; error: string };
 contextBridge.exposeInMainWorld('sentinelAPI', {
   selectDirectory: () => ipcRenderer.invoke('select-directory'),
   runAstScan: (dirPath: string) => ipcRenderer.invoke('run-ast-scan', dirPath),
+  cancelAstScan: () =>
+    ipcRenderer.invoke('cancel-ast-scan') as Promise<
+      { success: true; cancelled: true } | { success: false; error: string }
+    >,
   getDbStats: () =>
     ipcRenderer.invoke('get-db-stats') as Promise<
       { success: true; stats: DbStats; storagePath: string } | { success: false; error: string }
@@ -85,5 +89,13 @@ contextBridge.exposeInMainWorld('sentinelAPI', {
       cb(info);
     ipcRenderer.on('cve-sync-done', listener);
     return () => ipcRenderer.removeListener('cve-sync-done', listener);
+  },
+  onScanProgress: (
+    cb: (info: { phase: string; scannedFiles: number; totalFiles?: number }) => void,
+  ) => {
+    const listener = (_: unknown, info: { phase: string; scannedFiles: number; totalFiles?: number }) =>
+      cb(info);
+    ipcRenderer.on('ast-scan-progress', listener);
+    return () => ipcRenderer.removeListener('ast-scan-progress', listener);
   },
 });
