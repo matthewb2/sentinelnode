@@ -36,8 +36,17 @@ contextBridge.exposeInMainWorld('sentinelAPI', {
     >,
   importCveDir: (payload?: { dirPath?: string } & SyncOptions) =>
     ipcRenderer.invoke('import-cve-dir', payload) as Promise<
-      IpcOk<SyncResult & { stats: DbStats }> | IpcFail
+      IpcOk<SyncResult & { stats: DbStats }> | IpcFail | { success: false; cancelled: true }
     >,
+  cancelCveImport: () =>
+    ipcRenderer.invoke('cancel-cve-import') as Promise<
+      { success: true; cancelled: true } | { success: false; error: string }
+    >,
+  onCveImportProgress: (cb: (info: { scanned: number }) => void) => {
+    const listener = (_: unknown, info: { scanned: number }) => cb(info);
+    ipcRenderer.on('cve-import-progress', listener);
+    return () => ipcRenderer.removeListener('cve-import-progress', listener);
+  },
   fetchCve: (cveId: string) =>
     ipcRenderer.invoke('fetch-cve', cveId) as Promise<
       IpcOk<SyncResult & { stats: DbStats }> | IpcFail
@@ -97,5 +106,10 @@ contextBridge.exposeInMainWorld('sentinelAPI', {
       cb(info);
     ipcRenderer.on('ast-scan-progress', listener);
     return () => ipcRenderer.removeListener('ast-scan-progress', listener);
+  },
+  onOpenSettings: (cb: () => void) => {
+    const listener = () => cb();
+    ipcRenderer.on('open-settings', listener);
+    return () => ipcRenderer.removeListener('open-settings', listener);
   },
 });

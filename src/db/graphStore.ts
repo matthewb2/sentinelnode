@@ -32,6 +32,8 @@ export class GraphStore {
   private relationCounter = 0;
   /** (type/from/to) → relation 중복 검사 인덱스. link() O(N) 전수 스캔 방지 */
   private linkIndex = new Map<string, GraphRelation>();
+  /** affectedPackage(소문자) → Vulnerability 노드 인덱스. 대조 시 O(V) 전수 스캔 방지 */
+  private pkgIndex: Map<string, VulnerabilityNode[]> | null = null;
 
   constructor(private storagePath?: string) {
     if (storagePath) this.load();
@@ -58,6 +60,7 @@ export class GraphStore {
       this.relations = new Map((snap.relations ?? []).map((r) => [r.id, r]));
       this.relationCounter = this.relations.size;
       this.rebuildLinkIndex();
+      this.pkgIndex = null;
     } catch {
       // 손상된 스냅샷은 무시하고 빈 DB로 시작
     }
@@ -71,12 +74,13 @@ export class GraphStore {
       nodes: [...this.nodes.values()],
       relations: [...this.relations.values()],
     };
-    fs.writeFileSync(this.storagePath, JSON.stringify(snap, null, 2), 'utf-8');
+    fs.writeFileSync(this.storagePath, JSON.stringify(snap), 'utf-8');
   }
 
   // ── 노드 CRUD ────────────────────────────────────────────
   upsert(node: GraphNode): GraphNode {
     this.nodes.set(node.id, node);
+    if (node.kind === 'vulnerability') this.pkgIndex = null;
     return node;
   }
 
@@ -95,12 +99,22 @@ export class GraphStore {
     );
   }
 
-  /** 패키지명 기준 취약점 조회 (DEPENDS_ON 대조용) */
+  /** 패키지명 기준 취약점 조회 (DEPENDS_ON 대조용, 인덱스 O(1)) */
   findVulnerabilitiesByPackage(packageName: string): VulnerabilityNode[] {
     const name = packageName.toLowerCase();
-    return this.allVulnerabilities().filter(
-      (v) => v.affectedPackage?.toLowerCase() === name,
-    );
+    if (!this.pkgIndex) {
+      const index = new Map<string, VulnerabilityNode[]>();
+      for (const n of this.nodes.values()) {
+        if (n.kind !== 'vulnerability') continue;
+        const pkg = n.affectedPackage?.toLowerCase();
+        if (!pkg) continue;
+        const list = index.get(pkg);
+        if (list) list.push(n);
+        else index.set(pkg, [n]);
+      }
+      this.pkgIndex = index;
+    }
+    return this.pkgIndex.get(name) ?? [];
   }
 
   clearEphemeral(): void {

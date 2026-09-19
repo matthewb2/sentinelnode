@@ -20,7 +20,9 @@ declare global {
         | { success: false; error: string }
       >;
       syncCveNow: (opts?: object) => Promise<{ success: boolean; ingested?: number; scanned?: number; error?: string }>;
-      importCveDir: (payload?: object) => Promise<{ success: boolean; ingested?: number; scanned?: number; error?: string }>;
+      importCveDir: (payload?: object) => Promise<{ success: boolean; ingested?: number; scanned?: number; error?: string; cancelled?: boolean }>;
+      cancelCveImport: () => Promise<{ success: boolean; cancelled?: boolean; error?: string }>;
+      onCveImportProgress?: (cb: (info: { scanned: number }) => void) => () => void;
       fetchCve: (cveId: string) => Promise<{ success: boolean; ingested?: number; error?: string }>;
       setAutoSync: (enabled: boolean) => Promise<{ success: boolean; autoSync?: boolean }>;
       getAiFix: (payload: {
@@ -57,6 +59,7 @@ declare global {
       >;
       onCveSyncDone?: (cb: (info: { updated: boolean; ingested: number; tag: string | null }) => void) => () => void;
       onScanProgress?: (cb: (info: { phase: string; scannedFiles: number; totalFiles?: number }) => void) => () => void;
+      onOpenSettings?: (cb: () => void) => () => void;
     };
   }
 }
@@ -122,6 +125,7 @@ export default function App() {
   const [scanProgress, setScanProgress] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [reportPage, setReportPage] = useState(0);
+  const [importing, setImporting] = useState(false);
 
   const refreshDbInfo = async () => {
     try {
@@ -233,9 +237,14 @@ export default function App() {
         info.phase === 'parse' ? '병렬 파싱' : info.phase === 'match' ? '패턴 대조' : info.phase === 'done' ? '완료' : '파일 탐색';
       setScanProgress(`${phaseLabel} · ${info.scannedFiles}개 파일`);
     });
+    // 네이티브 앱 메뉴(파일 > 설정)에서 설정 다이얼로그 열기
+    const offSettings = window.sentinelAPI?.onOpenSettings?.(() => {
+      void openSettings();
+    });
     return () => {
       off?.();
       offProgress?.();
+      offSettings?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -282,19 +291,36 @@ export default function App() {
 
   const handleImportDir = async () => {
     setSyncBusy(true);
-    setSyncMsg(null);
+    setImporting(true);
+    setSyncMsg('로컬 클론 탐색 준비 중…');
+    const offProgress = window.sentinelAPI?.onCveImportProgress?.((info) => {
+      setSyncMsg(`로컬 클론 반영 중… ${info.scanned}건 스캔`);
+    });
     try {
       const res = await window.sentinelAPI.importCveDir();
       if (res.success) {
         setSyncMsg(`로컬 클론 반영 완료: 스캔 ${res.scanned ?? 0}건 중 ${res.ingested ?? 0}건 적재`);
         await refreshDbInfo();
+      } else if ((res as { cancelled?: boolean }).cancelled) {
+        setSyncMsg('가져오기가 중단되었습니다.');
       } else {
         setSyncMsg(res.error || '가져오기 실패');
       }
     } catch (err: any) {
       setSyncMsg(err.message || '가져오기 실패');
     } finally {
+      offProgress?.();
+      setImporting(false);
       setSyncBusy(false);
+    }
+  };
+
+  const handleCancelImport = async () => {
+    try {
+      await window.sentinelAPI.cancelCveImport();
+      // 중단 성공 시 importCveDir 결과가 cancelled로 반환되어 정리됨
+    } catch {
+      // 무시
     }
   };
 
@@ -448,28 +474,7 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-screen bg-white text-slate-900 font-sans select-none">
-      {/* 상단 헤더 영역 */}
-      <header className="px-6 py-4 border-b border-slate-200 flex items-center justify-between bg-white/90 backdrop-blur">
-        <div>          
-          <p className="text-xs text-slate-500">AST 기반 로컬 소스 코드 취약점 및 코딩 실수 진단 엔진</p>
-        </div>
-        <div className="flex items-center gap-3">
-          <div className="text-xs text-slate-500 font-mono">Engine: Babel AST + tree-sitter-c</div>
-          <button
-            onClick={() => void openSettings()}
-            title="그래프 DB 저장 폴더 설정"
-            className="bg-white hover:bg-slate-100 border border-slate-300 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-medium transition shadow-sm"
-          >
-            설정
-          </button>
-        </div>
-      </header>
-      {dbInfo && (
-        <div className="px-6 py-1.5 text-[11px] font-mono text-slate-500 bg-slate-50 border-b border-slate-200">
-          {dbInfo}
-        </div>
-      )}
-
+      
       {/* 컨트롤 패널 영역 */}
       <div className="p-6 pb-4 flex flex-col gap-3 border-b border-slate-200 bg-slate-50">
         <div className="flex gap-3 items-center">
@@ -548,15 +553,6 @@ export default function App() {
               ? `릴리스 ${syncStatus.lastReleaseTag ?? '-'} → ${syncStatus.latestTag ?? '-'} · 관심 패키지 ${syncStatus.watchlistSize}개 · 누적 ${syncStatus.ingestedTotal}건`
               : '동기화 상태 조회 중…'}
           </span>
-          <label className="ml-auto flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={syncStatus?.autoSync ?? true}
-              onChange={handleToggleAutoSync}
-              className="accent-indigo-600"
-            />
-            시작 시 자동 업데이트
-          </label>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button
@@ -578,8 +574,17 @@ export default function App() {
             disabled={syncBusy}
             className="bg-white hover:bg-slate-100 disabled:opacity-40 border border-slate-300 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-medium transition shadow-sm"
           >
-            클론 폴더 가져오기
+            {importing ? '가져오는 중…' : '클론 폴더 가져오기'}
           </button>
+          {importing && (
+            <button
+              onClick={() => void handleCancelImport()}
+              title="진행 중인 가져오기를 중단합니다"
+              className="bg-white hover:bg-rose-50 border border-rose-300 text-rose-600 px-3 py-1.5 rounded-lg text-xs font-medium transition shadow-sm"
+            >
+              가져오기 중지
+            </button>
+          )}
           <input
             value={cveIdInput}
             onChange={(e) => setCveIdInput(e.target.value)}
@@ -771,6 +776,15 @@ export default function App() {
         </div>
       </div>
 
+      {/* 하단 상태바: 그래프 DB 상태 정보 */}
+      <footer
+        className="px-6 py-1.5 text-[11px] font-mono text-slate-500 bg-slate-50 border-t border-slate-200 truncate"
+        title={dbFilePath || undefined}
+      >
+        {dbInfo ?? 'GraphDB 상태 조회 중…'}
+        {dbFilePath ? ` · ${dbFilePath}` : ''}
+      </footer>
+
       {/* 설정 다이얼로그: 그래프 DB 저장 폴더 */}
       {settingsOpen && (
         <div
@@ -830,6 +844,19 @@ export default function App() {
               </p>
             </div>
 
+            <div className="flex flex-col gap-1 border-t border-slate-100 pt-4">
+              <span className="text-xs font-medium text-slate-600">CVE 데이터베이스</span>
+              <label className="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={syncStatus?.autoSync ?? true}
+                  onChange={handleToggleAutoSync}
+                  className="accent-indigo-600"
+                />
+                시작 시 자동 업데이트
+              </label>
+            </div>
+
             {settingsMsg && (
               <div className="text-xs text-slate-600 bg-slate-50 border border-slate-200 px-3 py-2 rounded">
                 {settingsMsg}
@@ -863,7 +890,9 @@ export default function App() {
             </div>
           </div>
         </div>
-      )}
+      )}        
+
     </div>
+      
   );
 }

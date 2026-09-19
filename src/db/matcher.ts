@@ -8,7 +8,55 @@
  */
 import * as semver from 'semver';
 import type { GraphStore } from './graphStore';
-import type { CodeNode, MatchReport, VulnerabilityNode } from './types';
+import type { CodeNode, MatchReport, Severity, VulnerabilityNode } from './types';
+
+/** 패키지당 의존성 CVE 리포트 상한 (대규모 DB 리포트 폭증 방지) */
+export const MAX_DEP_REPORTS_PER_PACKAGE = 100;
+
+/** versionRange 문자열 → 파싱된 Range 캐시 (대조 시 반복 파싱 방지) */
+const rangeCache = new Map<string, semver.Range | null>();
+
+function cachedRange(range: string): semver.Range | null {
+  const hit = rangeCache.get(range);
+  if (hit !== undefined) return hit;
+  let parsed: semver.Range | null = null;
+  try {
+    parsed = new semver.Range(range);
+  } catch {
+    parsed = null;
+  }
+  rangeCache.set(range, parsed);
+  // 메모리 폭증 방지 (고유 range가 수만 개일 경우 오래된 항목 정리)
+  if (rangeCache.size > 5000) {
+    const oldest = rangeCache.keys().next();
+    if (!oldest.done) rangeCache.delete(oldest.value);
+  }
+  return parsed;
+}
+
+const SEVERITY_ORDER: Severity[] = ['critical', 'high', 'medium', 'low', 'info'];
+
+/** 적중 목록을 심각도순으로 정렬하고 상한까지 잘라 리포트로 변환 */
+function drainBySeverity(
+  buckets: Map<Severity, VulnerabilityNode[]>,
+  take: (vuln: VulnerabilityNode) => void,
+  max: number,
+): void {
+  let count = 0;
+  for (const sev of SEVERITY_ORDER) {
+    for (const vuln of buckets.get(sev) ?? []) {
+      if (count >= max) return;
+      take(vuln);
+      count += 1;
+    }
+  }
+}
+
+function bucketize(buckets: Map<Severity, VulnerabilityNode[]>, vuln: VulnerabilityNode): void {
+  const list = buckets.get(vuln.severity);
+  if (list) list.push(vuln);
+  else buckets.set(vuln.severity, [vuln]);
+}
 
 function matchAstSignature(code: CodeNode, vuln: VulnerabilityNode): boolean {
   const sig = vuln.astSignature;
@@ -78,26 +126,31 @@ export function matchDependencies(
     const pkg = store.ensurePackage(name, version ?? rawVersion);
     store.link('DEPENDS_ON', projectId, pkg.id, { version: version ?? rawVersion });
 
+    const hits = new Map<Severity, VulnerabilityNode[]>();
     for (const vuln of store.findVulnerabilitiesByPackage(name)) {
       if (!vuln.versionRange || !version) continue;
+      const range = cachedRange(vuln.versionRange);
+      if (!range) continue;
       let hit = false;
       try {
-        hit = semver.satisfies(version, vuln.versionRange, { includePrerelease: false });
+        hit = semver.satisfies(version, range, { includePrerelease: false });
       } catch {
         hit = false;
       }
-      if (hit) {
-        store.link('MATCHED', pkg.id, vuln.id, { version });
-        reports.push(
-          toReport(
-            'package.json',
-            0,
-            vuln,
-            { package: `${name}@${version}`, file: 'package.json', line: 0 },
-          ),
-        );
-      }
+      if (hit) bucketize(hits, vuln);
     }
+    // 심각도순·패키지당 상한 적용 (대규모 DB 리포트 폭증 방지)
+    drainBySeverity(hits, (vuln) => {
+      store.link('MATCHED', pkg.id, vuln.id, { version: version as string });
+      reports.push(
+        toReport(
+          'package.json',
+          0,
+          vuln,
+          { package: `${name}@${version}`, file: 'package.json', line: 0 },
+        ),
+      );
+    }, MAX_DEP_REPORTS_PER_PACKAGE);
   }
   return reports;
 }
@@ -138,14 +191,6 @@ export function headerToPackage(header: string): string {
   return (first || h).toLowerCase();
 }
 
-const SEVERITY_WEIGHT: Record<string, number> = {
-  critical: 0,
-  high: 1,
-  medium: 2,
-  low: 3,
-  info: 4,
-};
-
 /**
  * C/C++ `#include` ↔ CVE 대조.
  * 설치 버전(vcpkg/conan 등)을 알면 semver로 정밀 대조하고,
@@ -165,7 +210,13 @@ export function matchCIncludes(
     if (!byPackage.has(pkg)) byPackage.set(pkg, inc);
   }
 
-  const suspected: Array<{ vuln: VulnerabilityNode; ref: CIncludeRef; pkg: string }> = [];
+  const suspected = new Map<Severity, Array<{ vuln: VulnerabilityNode; ref: CIncludeRef; pkg: string }>>();
+
+  const pushSuspected = (entry: { vuln: VulnerabilityNode; ref: CIncludeRef; pkg: string }): void => {
+    const list = suspected.get(entry.vuln.severity);
+    if (list) list.push(entry);
+    else suspected.set(entry.vuln.severity, [entry]);
+  };
 
   for (const [pkg, ref] of byPackage) {
     const rawVersion = versions[pkg];
@@ -173,40 +224,46 @@ export function matchCIncludes(
     const pkgNode = store.ensurePackage(pkg, version ?? rawVersion);
     store.link('DEPENDS_ON', projectId, pkgNode.id, { version: version ?? rawVersion ?? 'unknown' });
 
+    const preciseHits = new Map<Severity, VulnerabilityNode[]>();
     for (const vuln of store.findVulnerabilitiesByPackage(pkg)) {
       if (version && vuln.versionRange) {
+        const range = cachedRange(vuln.versionRange);
+        if (!range) continue;
         let hit = false;
         try {
-          hit = semver.satisfies(version, vuln.versionRange, { includePrerelease: false });
+          hit = semver.satisfies(version, range, { includePrerelease: false });
         } catch {
           hit = false;
         }
-        if (hit) {
-          store.link('MATCHED', pkgNode.id, vuln.id, { version });
-          reports.push(
-            toReport(ref.file, ref.line, vuln, { package: `${pkg}@${version}` }),
-          );
-        }
+        if (hit) bucketize(preciseHits, vuln);
       } else {
-        suspected.push({ vuln, ref, pkg });
+        pushSuspected({ vuln, ref, pkg });
       }
     }
+    // 정밀 적중도 패키지당 상한 적용
+    drainBySeverity(preciseHits, (vuln) => {
+      store.link('MATCHED', pkgNode.id, vuln.id, { version: version as string });
+      reports.push(
+        toReport(ref.file, ref.line, vuln, { package: `${pkg}@${version}` }),
+      );
+    }, MAX_DEP_REPORTS_PER_PACKAGE);
   }
 
-  suspected.sort((a, b) => {
-    const w = (SEVERITY_WEIGHT[a.vuln.severity] ?? 9) - (SEVERITY_WEIGHT[b.vuln.severity] ?? 9);
-    if (w !== 0) return w;
-    return (a.vuln.cveId ?? a.vuln.id).localeCompare(b.vuln.cveId ?? b.vuln.id);
-  });
-
-  for (const { vuln, ref, pkg } of suspected.slice(0, maxSuspected)) {
-    store.link('MATCHED', `pkg:${pkg}`, vuln.id, { version: 'unknown' });
-    reports.push(
-      toReport(ref.file, ref.line, vuln, {
-        package: `${pkg}@unknown`,
-        message: `${vuln.description} (설치 버전 미확인 — #include <${ref.header}> 기준 의심)`,
-      }),
-    );
+  // 의심 후보는 심각도 버킷 순서대로 상한까지만 (전체 정렬 O(V log V) 회피)
+  let taken = 0;
+  for (const sev of SEVERITY_ORDER) {
+    for (const { vuln, ref, pkg } of suspected.get(sev) ?? []) {
+      if (taken >= maxSuspected) break;
+      store.link('MATCHED', `pkg:${pkg}`, vuln.id, { version: 'unknown' });
+      reports.push(
+        toReport(ref.file, ref.line, vuln, {
+          package: `${pkg}@unknown`,
+          message: `${vuln.description} (설치 버전 미확인 — #include <${ref.header}> 기준 의심)`,
+        }),
+      );
+      taken += 1;
+    }
+    if (taken >= maxSuspected) break;
   }
   return reports;
 }

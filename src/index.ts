@@ -1,7 +1,6 @@
-import { app, BrowserWindow, ipcMain, dialog } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, Menu } from 'electron';
 import { exec } from 'child_process';
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import dotenv from 'dotenv';
 import { runAstScan } from './engine/astScanner';
@@ -26,6 +25,7 @@ import {
   loadMeta,
   saveMeta,
   type SyncOptions,
+  type SyncResult,
 } from './db/cveSync';
 import type { FeedVulnerabilityItem } from './db/types';
 import { readSnippet } from './ai/context';
@@ -100,6 +100,53 @@ function createWindow(): void {
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
+
+  buildAppMenu();
+}
+
+/** 네이티브 앱 메뉴 — 설정은 메뉴 항목(파일 > 설정 / macOS 앱 메뉴)으로 제공 */
+function buildAppMenu(): void {
+  const openSettings = (): void => {
+    try {
+      mainWindow?.webContents.send('open-settings');
+    } catch {
+      // 윈도우 종료 등 무시
+    }
+  };
+  const settingsItem: Electron.MenuItemConstructorOptions = {
+    label: '설정...',
+    accelerator: 'CmdOrCtrl+,',
+    click: openSettings,
+  };
+  const template: Electron.MenuItemConstructorOptions[] =
+    process.platform === 'darwin'
+      ? [
+          {
+            label: 'SentinelNode',
+            submenu: [settingsItem, { type: 'separator' }, { role: 'quit', label: '종료' }],
+          },
+          {
+            label: '보기',
+            submenu: [
+              { role: 'reload', label: '다시 로드' },
+              { role: 'toggleDevTools', label: '개발자 도구' },
+            ],
+          },
+        ]
+      : [
+          {
+            label: '파일',
+            submenu: [settingsItem, { type: 'separator' }, { role: 'quit', label: '종료' }],
+          },
+          {
+            label: '보기',
+            submenu: [
+              { role: 'reload', label: '다시 로드' },
+              { role: 'toggleDevTools', label: '개발자 도구' },
+            ],
+          },
+        ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
 // 폴더 선택창 호출 — 마지막 사용 폴더를 기본 선택으로 제시, 선택 즉시 저장
@@ -130,16 +177,9 @@ function resolveChunkWorkerPath(): string | null {
   return null;
 }
 
-/** 워커 풀 크기 — 1코어는 UI/메인에 양보, 2~4개로 제한 */
+/** 워커 풀 크기 — 분석 스레드 4개 고정 */
 function resolvePoolSize(): number {
-  let cores = 4;
-  try {
-    cores =
-      typeof os.availableParallelism === 'function' ? os.availableParallelism() : (os.cpus()?.length ?? 4);
-  } catch {
-    cores = 4;
-  }
-  return Math.min(4, Math.max(2, cores - 1));
+  return 4;
 }
 
 const SCAN_CHUNK_SIZE = 25;
@@ -361,8 +401,24 @@ ipcMain.handle('sync-cve-now', async (_, opts?: SyncOptions) => {
   }
 });
 
-// 로컬 클론(cvelistV5/cves) 디렉토리에서 가져오기
+// 로컬 클론(cvelistV5/cves) 디렉토리에서 가져오기 — 전용 워커 스레드에서 실행.
+// 워커가 파싱·적재 후 디스크에 저장하면, 메인 싱글턴을 리로드한다.
+let activeImport: { worker: import('worker_threads').Worker; cancelled: boolean } | null = null;
+
+function resolveImportWorkerPath(): string | null {
+  const cand = path.join(__dirname, 'worker', 'cveImportWorker.js');
+  try {
+    if (fs.existsSync(cand)) return cand;
+  } catch {
+    // 무시하고 폴백
+  }
+  return null;
+}
+
 ipcMain.handle('import-cve-dir', async (_, payload?: { dirPath?: string } & SyncOptions) => {
+  if (activeImport) {
+    return { success: false, error: '이미 가져오기가 진행 중입니다.' };
+  }
   try {
     let dirPath = payload?.dirPath;
     if (!dirPath) {
@@ -371,14 +427,93 @@ ipcMain.handle('import-cve-dir', async (_, payload?: { dirPath?: string } & Sync
       dirPath = picked.filePaths[0];
     }
     // cves/ 하위를 직접 지정했거나 저장소 루트를 지정한 경우 모두 수용
-    const fs = await import('fs');
     const cvesDir = fs.existsSync(path.join(dirPath, 'cves'))
       ? path.join(dirPath, 'cves')
       : dirPath;
-    const result = importLocalDir(getDatabase(), cvesDir, payload ?? {});
-    return { success: true, ...result, stats: getDatabase().stats() };
+    const storagePath = defaultStoragePath();
+    const workerPath = resolveImportWorkerPath();
+    if (!workerPath) {
+      // 패키징 누락 등 예외 상황 폴백 (동기 블로킹 가능, 취소 불가)
+      const result = importLocalDir(getDatabase(), cvesDir, payload ?? {});
+      return { success: true, ...result, stats: getDatabase().stats() };
+    }
+    const { Worker: ThreadWorker } = await import('worker_threads');
+    const outcome = await new Promise<{ cancelled: boolean; result?: SyncResult }>((resolve, reject) => {
+      let settled = false;
+      const worker = new ThreadWorker(workerPath, {
+        workerData: {
+          cvesDir,
+          storagePath,
+          opts: {
+            maxRecords: payload?.maxRecords,
+            packageFilter: payload?.packageFilter,
+            includeNonNpm: payload?.includeNonNpm,
+          },
+        },
+      });
+      const imp = { worker, cancelled: false };
+      activeImport = imp;
+      const done = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
+        try {
+          fn();
+        } finally {
+          if (activeImport === imp) activeImport = null;
+          void worker.terminate();
+        }
+      };
+      worker.on('message', (msg: any) => {
+        if (msg?.type === 'progress') {
+          try {
+            mainWindow?.webContents.send('cve-import-progress', { scanned: msg.scanned });
+          } catch {
+            // 윈도우 종료 등 무시
+          }
+        } else if (msg?.type === 'done') {
+          done(() => resolve({
+            cancelled: false,
+            result: { scanned: msg.scanned, ingested: msg.ingested, skipped: msg.skipped, source: msg.source },
+          }));
+        } else if (msg?.type === 'error') {
+          done(() => reject(new Error(msg.error || '가져오기 워커 실패')));
+        }
+      });
+      worker.on('error', (err) => done(() => reject(err)));
+      worker.on('exit', (code) => {
+        // cancel-cve-import에 의한 종료면 정상적인 중단으로 처리
+        if (imp.cancelled) {
+          done(() => resolve({ cancelled: true }));
+        } else if (code !== 0) {
+          done(() => reject(new Error(`가져오기 워커 비정상 종료 (${code})`)));
+        }
+      });
+    });
+    if (outcome.cancelled) {
+      // 중단 시 워커는 완료 시에만 저장하므로 디스크 불일치 없음
+      return { success: false, cancelled: true };
+    }
+    // 워커가 저장한 스냅샷을 메인 싱글턴에 반영
+    const { reloadDatabase } = await import('./db');
+    reloadDatabase(storagePath);
+    return { success: true, ...outcome.result, stats: getDatabase().stats() };
   } catch (error: any) {
     return { success: false, error: error.message };
+  }
+});
+
+// 진행 중 CVE 가져오기 중단 — 워커 스레드 종료 (완료 시에만 저장)
+ipcMain.handle('cancel-cve-import', async () => {
+  const imp = activeImport;
+  if (!imp) {
+    return { success: false, error: '진행 중인 가져오기가 없습니다.' };
+  }
+  try {
+    imp.cancelled = true;
+    await imp.worker.terminate();
+    return { success: true, cancelled: true };
+  } catch (error: any) {
+    return { success: false, error: error.message || '가져오기 중단에 실패했습니다.' };
   }
 });
 

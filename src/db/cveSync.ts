@@ -44,6 +44,8 @@ export interface SyncOptions {
   packageFilter?: string[];
   /** true면 npm명 형태가 아닌 제품도 적재 */
   includeNonNpm?: boolean;
+  /** 진행률 콜백 (워커 스레드 → 메인 진행률 전달용) */
+  onProgress?: (info: { scanned: number }) => void;
 }
 
 export interface SyncResult {
@@ -155,6 +157,13 @@ export function importLocalDir(
         walk(full);
       } else if (entry.isFile() && /^CVE-.*\.json$/i.test(entry.name)) {
         scanned += 1;
+        if (scanned % 500 === 0) {
+          try {
+            opts.onProgress?.({ scanned });
+          } catch {
+            // 진행률 콜백 오류 무시
+          }
+        }
         if (scanned > max) {
           overLimit = true;
           return;
